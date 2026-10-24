@@ -1,0 +1,143 @@
+// regex: text as code points. Tessel's strings count characters as Unicode
+// code points (what `count` and `substring` use), so the matcher works on
+// the text's code points, decoded here from its UTF-8 bytes, and the
+// positions it gives are the same indexes `substring` takes.
+//
+// Author: Alexius Academia
+// Date: 2026-10-24
+
+// The code points of `text`, in order.
+fn codePoints(_ text: String) -> [Int] {
+    let b = Data(text: text).bytes
+    var out: [Int] = []
+    var i = 0
+    let n = b.count
+    while i < n {
+        let c = b[i]
+        if c < 128 {
+            out.append(c)
+            i += 1
+        } else if c < 224 && i + 1 < n {
+            out.append((c - 192) * 64 + (b[i + 1] - 128))
+            i += 2
+        } else if c < 240 && i + 2 < n {
+            out.append(((c - 224) * 64 + (b[i + 1] - 128)) * 64 + (b[i + 2] - 128))
+            i += 3
+        } else if i + 3 < n {
+            out.append((((c - 240) * 64 + (b[i + 1] - 128)) * 64 + (b[i + 2] - 128)) * 64 + (b[i + 3] - 128))
+            i += 4
+        } else {
+            // Tessel strings are valid UTF-8, so this isn't reached.
+            out.append(65533)
+            i += 1
+        }
+    }
+    out
+}
+
+// The UTF-8 bytes of the code point c, added to `bytes`.
+fn appendUtf8(_ bytes: [Int], _ c: Int) -> [Int] {
+    var out = bytes
+    if c < 128 {
+        out.append(c)
+    } else if c < 2048 {
+        out.append(192 + c / 64)
+        out.append(128 + c % 64)
+    } else if c < 65536 {
+        out.append(224 + c / 4096)
+        out.append(128 + (c / 64) % 64)
+        out.append(128 + c % 64)
+    } else {
+        out.append(240 + c / 262144)
+        out.append(128 + (c / 4096) % 64)
+        out.append(128 + (c / 64) % 64)
+        out.append(128 + c % 64)
+    }
+    out
+}
+
+// The code point c as a one-character string.
+fn character(_ c: Int) -> String {
+    Data(bytes: appendUtf8([], c)).text ?? ""
+}
+
+// The code point of the first character of s (for writing the pattern
+// syntax's characters by name: `ch("(")`).
+fn ch(_ s: String) -> Int {
+    codePoints(s)[0]
+}
+
+// Whether c is a word character for \w and \b: an ASCII letter, digit or _.
+fn isWord(_ c: Int) -> Bool {
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+// The other cases of the letter c: its upper or lower case partner, for
+// ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic. Empty for anything
+// else.
+fn otherCases(_ c: Int) -> [Int] {
+    // ASCII
+    if c >= 65 && c <= 90 {
+        return [c + 32]
+    }
+    if c >= 97 && c <= 122 {
+        return [c - 32]
+    }
+    // Latin-1: À-Þ and à-þ, except × and ÷; ÿ pairs with Ÿ.
+    if c >= 192 && c <= 222 && c != 215 {
+        return [c + 32]
+    }
+    if c >= 224 && c <= 254 && c != 247 {
+        return [c - 32]
+    }
+    if c == 255 {
+        return [376]
+    }
+    if c == 376 {
+        return [255]
+    }
+    // Latin Extended-A: mostly pairs, upper case first.
+    if c >= 256 && c <= 383 {
+        if c == 304 || c == 305 || c == 312 || c == 329 || c == 383 {
+            return []
+        }
+        if (c >= 313 && c <= 328) || (c >= 377 && c <= 382) {
+            // Pairs that start on an odd number: Ĺĺ … Ňň, Źź … Žž.
+            if c % 2 == 1 {
+                return [c + 1]
+            }
+            return [c - 1]
+        }
+        if c % 2 == 0 {
+            return [c + 1]
+        }
+        return [c - 1]
+    }
+    // Greek: Α-Ω and α-ω (with final sigma ς as another σ).
+    if c >= 913 && c <= 937 && c != 930 {
+        if c == 931 {
+            return [963, 962]
+        }
+        return [c + 32]
+    }
+    if c >= 945 && c <= 969 {
+        if c == 962 || c == 963 {
+            return [931, 1925 - c]
+        }
+        return [c - 32]
+    }
+    // Cyrillic: Ѐ-Џ with ѐ-џ, А-Я with а-я.
+    if c >= 1024 && c <= 1039 {
+        return [c + 80]
+    }
+    if c >= 1104 && c <= 1119 {
+        return [c - 80]
+    }
+    if c >= 1040 && c <= 1071 {
+        return [c + 32]
+    }
+    if c >= 1072 && c <= 1103 {
+        return [c - 32]
+    }
+    []
+}

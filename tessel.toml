@@ -1,0 +1,12 @@
+# The version of Tessel this project uses: Tessel's commands, editors and
+# the IDE run it with this version, whatever version is installed (and
+# install it the first time). `tessel pin` changes it.
+tessel = "0.10.0"
+
+# What `tessel publish` publishes. Programs use the library by this name:
+# `tessel add regex`, then `import regex`.
+[library]
+name = "regex"
+version = "0.1.0"
+description = "Regular expressions that always run in linear time: groups, classes, anchors, flags, replace and split"
+license = "MIT"

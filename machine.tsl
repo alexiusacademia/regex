@@ -1,0 +1,186 @@
+// regex: the matching machine, a Pike VM. It runs every way the pattern
+// could match at once, one character at a time: each "thread" is a place
+// in the program with the positions its groups have saved. A place reached
+// twice at the same character is followed once, so the work per character
+// is at most the program's size, and a match takes time in proportion to
+// the text, whatever the pattern. Threads are kept in priority order, which
+// gives the same match a backtracking engine would (leftmost, then the
+// first alternative and greedy or lazy repeats as written).
+//
+// Author: Alexius Academia
+// Date: 2026-10-24
+
+// One run of a program over a text.
+struct Machine {
+    ops: [Int]
+    xs: [Int]
+    ys: [Int]
+    classes: [[Int]]
+    slots: Int
+    cps: [Int]
+    // seen[pc] is the position at which pc was last added, so each place
+    // is added once per position.
+    seen: [Int] = []
+    // The threads to step at this position, and at the next.
+    nowPc: [Int] = []
+    nowCaps: [[Int]] = []
+    nextPc: [Int] = []
+    nextCaps: [[Int]] = []
+    // Places still to follow while adding a thread.
+    stackPc: [Int] = []
+    stackCaps: [[Int]] = []
+
+    // Whether the assertion `kind` holds at position `pos`.
+    fn holds(_ kind: Int, _ pos: Int) -> Bool {
+        let n = cps.count
+        if kind == atTextStart {
+            return pos == 0
+        }
+        if kind == atLineStart {
+            return pos == 0 || cps[pos - 1] == 10
+        }
+        if kind == atTextEnd {
+            return pos == n
+        }
+        if kind == atLineEnd {
+            return pos == n || cps[pos] == 10
+        }
+        let before = pos > 0 && isWord(cps[pos - 1])
+        let after = pos < n && isWord(cps[pos])
+        if kind == atWordBoundary {
+            return before != after
+        }
+        before == after
+    }
+
+    // Adds a thread at `pc`, following jumps, splits, saves and assertions
+    // (in priority order) to the places that consume a character or match,
+    // which go on the list for position `pos`: the next list when `toNext`.
+    fn addThread(_ pc0: Int, _ caps0: [Int], _ pos: Int, _ toNext: Bool) {
+        stackPc.append(pc0)
+        stackCaps.append(caps0)
+        while !stackPc.isEmpty {
+            let pc = stackPc.removeLast()
+            let caps = stackCaps.removeLast()
+            if seen[pc] != pos {
+                seen[pc] = pos
+                let op = ops[pc]
+                if op == opJump {
+                    stackPc.append(xs[pc])
+                    stackCaps.append(caps)
+                } else if op == opSplit {
+                    // The preferred path goes on top, to be followed first.
+                    stackPc.append(ys[pc])
+                    stackCaps.append(caps)
+                    stackPc.append(xs[pc])
+                    stackCaps.append(caps)
+                } else if op == opSave {
+                    var saved = caps
+                    saved[xs[pc]] = pos
+                    stackPc.append(pc + 1)
+                    stackCaps.append(saved)
+                } else if op == opAssert {
+                    if holds(xs[pc], pos) {
+                        stackPc.append(pc + 1)
+                        stackCaps.append(caps)
+                    }
+                } else if toNext {
+                    nextPc.append(pc)
+                    nextCaps.append(caps)
+                } else {
+                    nowPc.append(pc)
+                    nowCaps.append(caps)
+                }
+            }
+        }
+    }
+
+    // The first match starting at `start` or later (at `start` only when
+    // `anchored`; ending at the end of the text only when `toEnd`): the
+    // saved positions, two per group (-1 for a group that took no part), or
+    // [] when there's no match. `first` is a literal every match starts
+    // with, or -1.
+    fn run(_ start: Int, _ anchored: Bool, _ toEnd: Bool, _ first: Int) -> [Int] {
+        let n = cps.count
+        seen = []
+        for _ in 0..ops.count {
+            seen.append(-1)
+        }
+        var blank: [Int] = []
+        for _ in 0..slots {
+            blank.append(-1)
+        }
+        var matched: [Int] = []
+        var found = false
+        var pos = start
+        nowPc = []
+        nowCaps = []
+        while true {
+            if nowPc.isEmpty && !found {
+                if anchored && pos > start {
+                    return matched
+                }
+                if first >= 0 && !anchored {
+                    // Skip to where the first literal is.
+                    while pos < n && cps[pos] != first {
+                        pos += 1
+                    }
+                    if pos >= n {
+                        return matched
+                    }
+                }
+            }
+            if !found && (!anchored || pos == start) {
+                addThread(0, blank, pos, false)
+            }
+            if nowPc.isEmpty {
+                // No path is alive. Without a match yet, a search goes on
+                // from the next position.
+                if found || anchored || pos >= n {
+                    return matched
+                }
+                pos += 1
+                continue
+            }
+            var c = -1
+            if pos < n {
+                c = cps[pos]
+            }
+            nextPc = []
+            nextCaps = []
+            var t = 0
+            while t < nowPc.count {
+                let pc = nowPc[t]
+                let op = ops[pc]
+                if op == opMatch {
+                    if !toEnd || pos == n {
+                        matched = nowCaps[t]
+                        found = true
+                        // Threads after this one have lower priority.
+                        t = nowPc.count
+                    }
+                } else if c >= 0 {
+                    var ok = false
+                    if op == opChar {
+                        ok = c == xs[pc]
+                    } else if op == opClass {
+                        ok = classHas(classes[xs[pc]], c)
+                    } else if op == opAny {
+                        ok = xs[pc] == 1 || c != 10
+                    }
+                    if ok {
+                        addThread(pc + 1, nowCaps[t], pos + 1, true)
+                    }
+                }
+                t += 1
+            }
+            if pos >= n {
+                return matched
+            }
+            nowPc = nextPc
+            nowCaps = nextCaps
+            pos += 1
+        }
+        matched
+    }
+}

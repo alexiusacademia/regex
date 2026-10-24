@@ -1,0 +1,397 @@
+// regex: the public face. `compile` reads a pattern into a `Regex`; its
+// methods find, test, replace and split. Positions are character indexes,
+// the ones Tessel's `substring` takes.
+//
+// In a Tessel string a backslash is written \\ and a brace \{, so the
+// pattern \d{3} is written "\\d\{3}".
+//
+// Author: Alexius Academia
+// Date: 2026-10-24
+
+// A compiled pattern. Make one with `regex.compile` (or `regex.must`).
+//
+// Fields:
+//   pattern: The pattern it was made from.
+//   groupCount: How many capturing groups it has (group 0, the whole
+//               match, isn't counted).
+//   groupNames: Each group's name, by number ("" for one without a name);
+//               groupNames[0] is the whole match's, always "".
+//   ops, xs, ys, classes, first: The compiled program, for the machine.
+//
+// Example:
+//   let date = try regex.compile("(\\d\{4})-(\\d\{2})-(\\d\{2})")
+//   if let m = date.find("Due 2026-10-31.") {
+//       print(m.group(1) ?? "")   // 2026
+//   }
+public struct Regex {
+    pattern: String
+    groupCount: Int
+    groupNames: [String]
+    ops: [Int]
+    xs: [Int]
+    ys: [Int]
+    classes: [[Int]]
+    first: Int
+
+    // Whether the pattern matches anywhere in `text`.
+    //
+    // Example:
+    //   print(regex.must("\\d").matches("room 4"))   // true
+    fn matches(_ text: String) -> Bool {
+        var m = machine(codePoints(text))
+        return !m.run(0, false, false, first).isEmpty
+    }
+
+    // Whether the pattern matches the whole of `text`, from its first
+    // character to its last.
+    //
+    // Example:
+    //   let id = regex.must("[A-Z]\{3}-\\d\{4}")
+    //   print(id.matchesWhole("ABC-1234"))    // true
+    //   print(id.matchesWhole("ABC-12345"))   // false
+    fn matchesWhole(_ text: String) -> Bool {
+        var m = machine(codePoints(text))
+        return !m.run(0, true, true, -1).isEmpty
+    }
+
+    // The first match in `text` that starts at character `from` or later,
+    // or nil when there's none.
+    fn find(_ text: String, from: Int = 0) -> Match? {
+        let cps = codePoints(text)
+        if from < 0 || from > cps.count {
+            return nil
+        }
+        var m = machine(cps)
+        let caps = m.run(from, false, false, first)
+        if caps.isEmpty {
+            return nil
+        }
+        makeMatch(cps, caps)
+    }
+
+    // Every match in `text`, from left to right, none overlapping. An
+    // empty match right where the one before it ended is left out.
+    //
+    // Example:
+    //   for m in regex.must("\\d+").findAll("3 apples, 12 pears") {
+    //       print(m.text)   // 3, then 12
+    //   }
+    fn findAll(_ text: String) -> [Match] {
+        let cps = codePoints(text)
+        var out: [Match] = []
+        var m = machine(cps)
+        var pos = 0
+        var lastEnd = -1
+        while pos <= cps.count {
+            let caps = m.run(pos, false, false, first)
+            if caps.isEmpty {
+                return out
+            }
+            let s = caps[0]
+            let e = caps[1]
+            if s == e && s == lastEnd {
+                // An empty match where the last one ended: try one further.
+                pos = s + 1
+            } else {
+                out.append(makeMatch(cps, caps))
+                lastEnd = e
+                if e > s {
+                    pos = e
+                } else {
+                    pos = e + 1
+                }
+            }
+        }
+        out
+    }
+
+    // How many matches `findAll` finds.
+    fn count(_ text: String) -> Int {
+        findAll(text).count
+    }
+
+    // `text` with its first match replaced by `with`, in which $1 is group
+    // 1's text, $\{name} (or $<name>) a named group's, $0 the whole match,
+    // and $$ a dollar sign.
+    fn replace(_ text: String, with: String) -> String {
+        if let m = find(text) {
+            return text.substring(from: 0, to: m.start) + expand(with, m) + text.substring(from: m.end, to: text.count)
+        }
+        text
+    }
+
+    // `text` with every match replaced by `with` (see `replace` for $1,
+    // $\{name}, $0 and $$).
+    //
+    // Example:
+    //   let r = regex.must("(\\w+)@(\\w+)\\.com")
+    //   print(r.replaceAll("ann@mail.com, bo@site.com", with: "$2: $1"))
+    //   // mail: ann, site: bo
+    fn replaceAll(_ text: String, with: String) -> String {
+        let cps = codePoints(text)
+        var out = ""
+        var at = 0
+        for m in findAll(text) {
+            out += textOf(cps, at, m.start) + expand(with, m)
+            at = m.end
+        }
+        out + textOf(cps, at, cps.count)
+    }
+
+    // `text` with every match replaced by what `f` gives for it.
+    //
+    // Example:
+    //   let words = regex.must("\\b[a-z]")
+    //   print(words.replaceEach("hello big world") { m in m.text.uppercase() })
+    //   // Hello Big World
+    fn replaceEach(_ text: String, _ f: fn(Match) -> String) -> String {
+        let cps = codePoints(text)
+        var out = ""
+        var at = 0
+        for m in findAll(text) {
+            out += textOf(cps, at, m.start) + f(m)
+            at = m.end
+        }
+        out + textOf(cps, at, cps.count)
+    }
+
+    // The parts of `text` between the matches. With a `limit` above 0, at
+    // most that many parts: the last is the rest of the text.
+    //
+    // Example:
+    //   print(regex.must("\\s*,\\s*").split("a , b,c ,d"))   // ["a", "b", "c", "d"]
+    fn split(_ text: String, limit: Int = 0) -> [String] {
+        // As Go's Split does it, so the two agree.
+        if limit == 1 {
+            return [text]
+        }
+        let cps = codePoints(text)
+        if pattern != "" && cps.isEmpty {
+            return [""]
+        }
+        var parts: [String] = []
+        var begin = 0
+        var end = 0
+        for m in findAll(text) {
+            if limit > 0 && parts.count == limit - 1 {
+                return parts + [textOf(cps, begin, cps.count)]
+            }
+            end = m.start
+            // An empty match at the very start splits off nothing.
+            if m.end != 0 {
+                parts.append(textOf(cps, begin, end))
+            }
+            begin = m.end
+        }
+        // Nothing after a match that starts at the very end.
+        if end != cps.count {
+            parts.append(textOf(cps, begin, cps.count))
+        }
+        parts
+    }
+
+    // The number of the group called `name`, or nil when there's none.
+    fn groupIndex(_ name: String) -> Int? {
+        if name == "" {
+            return nil
+        }
+        groupNames.index(of: name)
+    }
+
+    // A machine to run this program over the code points `cps`.
+    fn machine(_ cps: [Int]) -> Machine {
+        Machine(ops: ops, xs: xs, ys: ys, classes: classes, slots: 2 * (groupCount + 1), cps: cps)
+    }
+
+    // A Match from the saved positions.
+    fn makeMatch(_ cps: [Int], _ caps: [Int]) -> Match {
+        var texts: [String] = []
+        var k = 0
+        while k + 1 < caps.count {
+            if caps[k] >= 0 && caps[k + 1] >= 0 {
+                texts.append(textOf(cps, caps[k], caps[k + 1]))
+            } else {
+                texts.append("")
+            }
+            k += 2
+        }
+        Match(start: caps[0], end: caps[1], text: texts[0], positions: caps, texts: texts, names: groupNames)
+    }
+
+    // The replacement template `t` with $1, $\{name}, $<name>, $0 and $$
+    // filled in from m.
+    fn expand(_ t: String, _ m: Match) -> String {
+        let tc = codePoints(t)
+        var out: [Int] = []
+        var k = 0
+        while k < tc.count {
+            let c = tc[k]
+            if c != 36 || k + 1 >= tc.count {
+                out.append(c)
+                k += 1
+            } else {
+                let d = tc[k + 1]
+                if d == 36 {
+                    out.append(36)
+                    k += 2
+                } else if d >= 48 && d <= 57 {
+                    var j = k + 1
+                    var number = 0
+                    while j < tc.count && tc[j] >= 48 && tc[j] <= 57 {
+                        number = number * 10 + tc[j] - 48
+                        j += 1
+                    }
+                    out.appendAll(codePoints(m.group(number) ?? ""))
+                    k = j
+                } else if d == 123 || d == 60 {
+                    // ${name} or $<name>
+                    var close = 125
+                    if d == 60 {
+                        close = 62
+                    }
+                    var j = k + 2
+                    while j < tc.count && tc[j] != close {
+                        j += 1
+                    }
+                    if j >= tc.count {
+                        out.append(c)
+                        k += 1
+                    } else {
+                        let name = textOf(tc, k + 2, j)
+                        var value = ""
+                        if let n = Int(name) {
+                            value = m.group(n) ?? ""
+                        } else {
+                            value = m.named(name) ?? ""
+                        }
+                        out.appendAll(codePoints(value))
+                        k = j + 1
+                    }
+                } else {
+                    out.append(c)
+                    k += 1
+                }
+            }
+        }
+        textOf(out, 0, out.count)
+    }
+}
+
+// One match of a pattern in a text.
+//
+// Fields:
+//   start: The character index where it starts.
+//   end: The index just after its last character (start for an empty
+//        match), so its text is `text.substring(from: start, to: end)`.
+//   text: The matched text.
+//   positions: Where each group starts and ends, two to a group (group 0
+//              is the whole match); -1 for a group that took no part.
+//   texts: Each group's text ("" for one that took no part).
+//   names: Each group's name ("" for one without).
+public struct Match {
+    start: Int
+    end: Int
+    text: String
+    positions: [Int]
+    texts: [String]
+    names: [String]
+
+    // Group i's text (0 is the whole match), or nil when the group took no
+    // part in the match or there's no group i.
+    fn group(_ i: Int) -> String? {
+        if i < 0 || 2 * i + 1 >= positions.count || positions[2 * i] < 0 {
+            return nil
+        }
+        texts[i]
+    }
+
+    // The text of the group called `name`, or nil when it took no part or
+    // there's no such group.
+    fn named(_ name: String) -> String? {
+        if name == "" {
+            return nil
+        }
+        if let i = names.index(of: name) {
+            return group(i)
+        }
+        nil
+    }
+
+    // Where group i starts, or nil when it took no part.
+    fn groupStart(_ i: Int) -> Int? {
+        if i < 0 || 2 * i + 1 >= positions.count || positions[2 * i] < 0 {
+            return nil
+        }
+        positions[2 * i]
+    }
+
+    // Where group i ends (just after its last character), or nil when it
+    // took no part.
+    fn groupEnd(_ i: Int) -> Int? {
+        if i < 0 || 2 * i + 1 >= positions.count || positions[2 * i] < 0 {
+            return nil
+        }
+        positions[2 * i + 1]
+    }
+
+    // How many groups the pattern has (not counting the whole match).
+    groupCount: Int { positions.count / 2 - 1 }
+}
+
+// Reads a pattern.
+//
+// Returns:
+//   The compiled `Regex`, or a failure saying what's wrong with the pattern
+//   and where (the index of the character in it).
+//
+// Example:
+//   match regex.compile("(\\d+") {
+//       .ok(r) -> print(r.matches("12"))
+//       .failure(e) -> print(e.message)   // missing ) for this ( at index 0 of "(\d+"
+//   }
+public fn compile(_ pattern: String) -> Result<Regex> {
+    var parser = Parser(pattern: pattern, p: codePoints(pattern))
+    let top = try parser.parseAll()
+    var b = Builder(nodes: parser.nodes)
+    let start = b.emit(opSave, 0, 0)
+    b.node(top)
+    let end = b.emit(opSave, 1, 0)
+    let done = b.emit(opMatch, 0, 0)
+    if b.tooBig {
+        return Result.failure(error: Error("the pattern is too big once its repeats are written out (more than {maxProgram} steps): \"{pattern}\""))
+    }
+    Result.ok(value: Regex(pattern: pattern, groupCount: parser.names.count - 1, groupNames: parser.names,
+        ops: b.ops, xs: b.xs, ys: b.ys, classes: parser.classes, first: firstLiteral(b.ops, b.xs)))
+}
+
+// Reads a pattern that's known to be right, like one written in the code:
+// a mistake in it stops the program with the reason.
+//
+// Example:
+//   let digits = regex.must("\\d+")
+public fn must(_ pattern: String) -> Regex {
+    match compile(pattern) {
+        .ok(r) -> r
+        .failure(e) -> {
+            printError("regex: {e.message}")
+            exit(1)
+            Regex(pattern: pattern, groupCount: 0, groupNames: [""], ops: [opMatch], xs: [0], ys: [0], classes: [], first: -1)
+        }
+    }
+}
+
+// `text` with a backslash before each character that means something in a
+// pattern, so the pattern matches the text exactly.
+//
+// Example:
+//   print(regex.escape("1+1=2?"))   // 1\+1=2\?
+public fn escape(_ text: String) -> String {
+    var out = ""
+    for c in text.characters {
+        if "\\.+*?()|[]\{}^$".contains(c) {
+            out += "\\"
+        }
+        out += c
+    }
+    out
+}

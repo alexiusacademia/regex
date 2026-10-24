@@ -1,0 +1,683 @@
+// regex: reading a pattern. The parser turns the pattern's text into a tree
+// of nodes (kept in a list, children by index), checking it as it goes so a
+// mistake is reported with where it is. The syntax is RE2's, which Go and
+// Rust also use; backreferences and lookarounds are refused, since they
+// can't be matched in linear time.
+//
+// Author: Alexius Academia
+// Date: 2026-10-24
+
+// Node kinds.
+let nodeEmpty = 0
+let nodeLiteral = 1
+let nodeClass = 2
+let nodeAny = 3
+let nodeConcat = 4
+let nodeAlternate = 5
+let nodeRepeat = 6
+let nodeGroup = 7
+let nodeAssert = 8
+
+// Assertion kinds.
+let atTextStart = 0
+let atLineStart = 1
+let atTextEnd = 2
+let atLineEnd = 3
+let atWordBoundary = 4
+let atNotWordBoundary = 5
+
+// The most a counted repeat {n,m} may count.
+let maxRepeat = 1000
+
+// The deepest groups may nest.
+let maxDepth = 500
+
+// One node of a parsed pattern.
+//
+// Fields:
+//   kind: One of the node kinds above.
+//   value: A literal's code point, a class's index, a group's number, an
+//          assertion's kind, or for `.`, 1 when it matches line breaks too.
+//   low, high: A repeat's counts (high -1 for no limit).
+//   greedy: Whether a repeat takes as much as it can (else as little).
+//   children: The nodes inside, by index.
+struct Node {
+    kind: Int
+    value: Int = 0
+    low: Int = 0
+    high: Int = 0
+    greedy: Bool = true
+    children: [Int] = []
+}
+
+// The state of reading one pattern.
+struct Parser {
+    pattern: String
+    p: [Int]
+    i: Int = 0
+    nodes: [Node] = []
+    classes: [[Int]] = []
+    names: [String] = [""]
+    caseless: Bool = false
+    multiline: Bool = false
+    dotAll: Bool = false
+    depth: Int = 0
+
+    // Adds a node and gives its index.
+    fn add(_ n: Node) -> Int {
+        nodes.append(n)
+        nodes.count - 1
+    }
+
+    // A failure saying what's wrong, and where.
+    fn problem(_ message: String) -> Result<Int> {
+        Result.failure(error: Error("{message} at index {i} of \"{pattern}\""))
+    }
+
+    // Whether the next characters are `s`.
+    fn looking(_ s: String) -> Bool {
+        let want = codePoints(s)
+        if i + want.count > p.count {
+            return false
+        }
+        for k in 0..want.count {
+            if p[i + k] != want[k] {
+                return false
+            }
+        }
+        true
+    }
+
+    // The whole pattern.
+    fn parseAll() -> Result<Int> {
+        let top = try parseAlternation()
+        if i < p.count {
+            // Only an unmatched ) stops an alternation early.
+            return problem("unmatched )")
+        }
+        Result.ok(value: top)
+    }
+
+    // Alternatives separated by |.
+    fn parseAlternation() -> Result<Int> {
+        var branches = [try parseConcat()]
+        while i < p.count && p[i] == ch("|") {
+            i += 1
+            branches.append(try parseConcat())
+        }
+        if branches.count == 1 {
+            return Result.ok(value: branches[0])
+        }
+        Result.ok(value: add(Node(kind: nodeAlternate, children: branches)))
+    }
+
+    // Items one after another, up to a |, a ) or the end.
+    fn parseConcat() -> Result<Int> {
+        var items: [Int] = []
+        while i < p.count && p[i] != ch("|") && p[i] != ch(")") {
+            let item = try parseRepeat()
+            if item >= 0 {
+                items.append(item)
+            }
+        }
+        if items.isEmpty {
+            return Result.ok(value: add(Node(kind: nodeEmpty)))
+        }
+        if items.count == 1 {
+            return Result.ok(value: items[0])
+        }
+        Result.ok(value: add(Node(kind: nodeConcat, children: items)))
+    }
+
+    // An item and the repeat after it, if any. -1 for a flags group like
+    // (?i), which sets flags and matches nothing.
+    fn parseRepeat() -> Result<Int> {
+        let start = i
+        let atom = try parseAtom()
+        if atom < 0 {
+            return Result.ok(value: atom)
+        }
+        var low = -1
+        var high = -1
+        if i < p.count {
+            let c = p[i]
+            if c == ch("*") {
+                low = 0
+                high = -1
+                i += 1
+            } else if c == ch("+") {
+                low = 1
+                high = -1
+                i += 1
+            } else if c == ch("?") {
+                low = 0
+                high = 1
+                i += 1
+            } else if c == ch("\{") {
+                let counts = countedRepeat()
+                if counts.0 >= 0 {
+                    low = counts.0
+                    high = counts.1
+                    if high >= 0 && high < low {
+                        return problem("the repeat \{{low},{high}} counts down")
+                    }
+                    if low > maxRepeat || high > maxRepeat {
+                        return problem("a repeat can count to {maxRepeat} at most")
+                    }
+                }
+            }
+        }
+        if low < 0 {
+            return Result.ok(value: atom)
+        }
+        var greedy = true
+        if i < p.count && p[i] == ch("?") {
+            greedy = false
+            i += 1
+        }
+        if i < p.count && (p[i] == ch("*") || p[i] == ch("+") || (p[i] == ch("?")) || (p[i] == ch("\{") && countedRepeat().0 >= 0)) {
+            return problem("a repeat right after another; put the first in a group, like (a*)*")
+        }
+        if start == i {
+            return problem("nothing to repeat")
+        }
+        Result.ok(value: add(Node(kind: nodeRepeat, low: low, high: high, greedy: greedy, children: [atom])))
+    }
+
+    // Reads {n}, {n,} or {n,m} at i, giving its counts (m is -1 for none)
+    // and moving past it; (-1, -1) and staying put when it isn't one, so
+    // the { is a literal brace.
+    fn countedRepeat() -> (Int, Int) {
+        var k = i + 1
+        var low = 0
+        var digits = 0
+        while k < p.count && p[k] >= 48 && p[k] <= 57 && digits < 8 {
+            low = low * 10 + p[k] - 48
+            k += 1
+            digits += 1
+        }
+        if digits == 0 || k >= p.count {
+            return (-1, -1)
+        }
+        var high = low
+        if p[k] == ch(",") {
+            k += 1
+            high = -1
+            var more = 0
+            var m = 0
+            while k < p.count && p[k] >= 48 && p[k] <= 57 && more < 8 {
+                m = m * 10 + p[k] - 48
+                k += 1
+                more += 1
+            }
+            if more > 0 {
+                high = m
+            }
+        }
+        if k >= p.count || p[k] != ch("}") {
+            return (-1, -1)
+        }
+        i = k + 1
+        (low, high)
+    }
+
+    // One item: a character, a class, a group, an escape or an anchor.
+    fn parseAtom() -> Result<Int> {
+        let c = p[i]
+        if c == ch("(") {
+            return parseGroup()
+        }
+        if c == ch("[") {
+            return parseClass()
+        }
+        if c == ch(".") {
+            i += 1
+            var all = 0
+            if dotAll {
+                all = 1
+            }
+            return Result.ok(value: add(Node(kind: nodeAny, value: all)))
+        }
+        if c == ch("^") {
+            i += 1
+            var kind = atTextStart
+            if multiline {
+                kind = atLineStart
+            }
+            return Result.ok(value: add(Node(kind: nodeAssert, value: kind)))
+        }
+        if c == ch("$") {
+            i += 1
+            var kind = atTextEnd
+            if multiline {
+                kind = atLineEnd
+            }
+            return Result.ok(value: add(Node(kind: nodeAssert, value: kind)))
+        }
+        if c == ch("\\") {
+            return parseEscape()
+        }
+        if c == ch("*") || c == ch("+") || c == ch("?") {
+            return problem("nothing to repeat")
+        }
+        if c == ch("\{") {
+            let here = i
+            let counts = countedRepeat()
+            if counts.0 >= 0 {
+                i = here
+                return problem("nothing to repeat")
+            }
+        }
+        i += 1
+        Result.ok(value: literal(c))
+    }
+
+    // A node for the code point c: a literal, or with (?i) a class of its
+    // cases.
+    fn literal(_ c: Int) -> Int {
+        if caseless {
+            let others = otherCases(c)
+            if !others.isEmpty {
+                var ranges = [c, c]
+                for o in others {
+                    ranges.append(o)
+                    ranges.append(o)
+                }
+                return addClass(normalized(ranges))
+            }
+        }
+        add(Node(kind: nodeLiteral, value: c))
+    }
+
+    // A node for a class of normalized ranges.
+    fn addClass(_ ranges: [Int]) -> Int {
+        classes.append(ranges)
+        add(Node(kind: nodeClass, value: classes.count - 1))
+    }
+
+    // A group: ( … ), (?: … ), (?P<name> … ), (?<name> … ), or flags:
+    // (?i) for the rest of the group, (?i: … ) for what's inside.
+    fn parseGroup() -> Result<Int> {
+        let open = i
+        i += 1
+        var capture = true
+        var name = ""
+        if i < p.count && p[i] == ch("?") {
+            if looking("?=") || looking("?!") || looking("?<=") || looking("?<!") {
+                return problem("lookarounds like (?=…) aren't supported: they can't be matched in linear time")
+            }
+            if looking("?P=") || looking("?P>") {
+                return problem("backreferences aren't supported: they can't be matched in linear time")
+            }
+            if looking("?P<") || looking("?<") {
+                i += 2
+                if p[i - 1] == ch("P") {
+                    i += 1
+                }
+                let nameStart = i
+                while i < p.count && isWord(p[i]) {
+                    i += 1
+                }
+                if i >= p.count || p[i] != ch(">") || i == nameStart {
+                    return problem("a group's name is letters, digits and _, then >")
+                }
+                name = textOf(p, nameStart, i)
+                if names.contains(name) {
+                    return problem("two groups are named \"{name}\"")
+                }
+                i += 1
+            } else {
+                // Flags: (?ims-ims) or (?ims-ims: … )
+                i += 1
+                var on = true
+                var sawFlag = false
+                var c2 = caseless
+                var m2 = multiline
+                var s2 = dotAll
+                var done = false
+                while !done {
+                    if i >= p.count {
+                        return problem("missing ) after the flags")
+                    }
+                    let c = p[i]
+                    if c == ch("i") {
+                        c2 = on
+                        sawFlag = true
+                    } else if c == ch("m") {
+                        m2 = on
+                        sawFlag = true
+                    } else if c == ch("s") {
+                        s2 = on
+                        sawFlag = true
+                    } else if c == ch("-") && on {
+                        on = false
+                    } else if c == ch(")") || c == ch(":") {
+                        done = true
+                    } else {
+                        return problem("unknown flag \"{character(c)}\": the flags are i, m and s")
+                    }
+                    if !done {
+                        i += 1
+                    }
+                }
+                if !sawFlag && p[i] == ch(")") {
+                    return problem("empty flags (?)")
+                }
+                if p[i] == ch(")") {
+                    // (?i): for the rest of the enclosing group.
+                    i += 1
+                    caseless = c2
+                    multiline = m2
+                    dotAll = s2
+                    return Result.ok(value: -1)
+                }
+                // (?i: … ): for what's inside only.
+                i += 1
+                let saved = (caseless, multiline, dotAll)
+                caseless = c2
+                multiline = m2
+                dotAll = s2
+                let inner = try parseInside(open)
+                caseless = saved.0
+                multiline = saved.1
+                dotAll = saved.2
+                return Result.ok(value: inner)
+            }
+        }
+        var number = 0
+        if capture {
+            number = names.count
+            names.append(name)
+        }
+        let saved = (caseless, multiline, dotAll)
+        let inner = try parseInside(open)
+        caseless = saved.0
+        multiline = saved.1
+        dotAll = saved.2
+        Result.ok(value: add(Node(kind: nodeGroup, value: number, children: [inner])))
+    }
+
+    // What's inside a group, up to and past its ).
+    fn parseInside(_ open: Int) -> Result<Int> {
+        depth += 1
+        if depth > maxDepth {
+            return problem("groups nest more than {maxDepth} deep")
+        }
+        let inner = try parseAlternation()
+        depth -= 1
+        if i >= p.count || p[i] != ch(")") {
+            i = open
+            return problem("missing ) for this (")
+        }
+        i += 1
+        Result.ok(value: inner)
+    }
+
+    // An escape outside a class: \d \w \s and their opposites, \b \B \A \z,
+    // a character like \n or \x41, or a punctuation mark taken literally.
+    fn parseEscape() -> Result<Int> {
+        let at = i
+        if i + 1 >= p.count {
+            return problem("the pattern ends with a lone \\")
+        }
+        let c = p[i + 1]
+        if c == ch("b") || c == ch("B") || c == ch("A") || c == ch("z") {
+            i += 2
+            var kind = atWordBoundary
+            if c == ch("B") {
+                kind = atNotWordBoundary
+            } else if c == ch("A") {
+                kind = atTextStart
+            } else if c == ch("z") {
+                kind = atTextEnd
+            }
+            return Result.ok(value: add(Node(kind: nodeAssert, value: kind)))
+        }
+        if c >= ch("1") && c <= ch("9") {
+            return problem("backreferences like \\1 aren't supported: they can't be matched in linear time")
+        }
+        let set = try escapedSet()
+        if set.count == 2 && set[0] == set[1] {
+            return Result.ok(value: literal(set[0]))
+        }
+        var ranges = set
+        if caseless {
+            ranges = caseFolded(ranges)
+        }
+        i = max(i, at + 2)
+        Result.ok(value: addClass(ranges))
+    }
+
+    // The code points an escape at i stands for, as ranges (one code point
+    // c is [c, c]), moving past it. For use outside and inside classes.
+    fn escapedSet() -> Result<[Int]> {
+        let c = p[i + 1]
+        i += 2
+        if c == ch("d") {
+            return Result.ok(value: digitRanges())
+        }
+        if c == ch("D") {
+            return Result.ok(value: negated(digitRanges()))
+        }
+        if c == ch("w") {
+            return Result.ok(value: wordRanges())
+        }
+        if c == ch("W") {
+            return Result.ok(value: negated(wordRanges()))
+        }
+        if c == ch("s") {
+            return Result.ok(value: spaceRanges())
+        }
+        if c == ch("S") {
+            return Result.ok(value: negated(spaceRanges()))
+        }
+        if c == ch("n") {
+            return Result.ok(value: [10, 10])
+        }
+        if c == ch("t") {
+            return Result.ok(value: [9, 9])
+        }
+        if c == ch("r") {
+            return Result.ok(value: [13, 13])
+        }
+        if c == ch("f") {
+            return Result.ok(value: [12, 12])
+        }
+        if c == ch("v") {
+            return Result.ok(value: [11, 11])
+        }
+        if c == ch("a") {
+            return Result.ok(value: [7, 7])
+        }
+        if c == ch("0") {
+            return Result.ok(value: [0, 0])
+        }
+        if c == ch("x") || c == ch("u") {
+            let code = try hexEscape(c == ch("u"))
+            return Result.ok(value: [code, code])
+        }
+        i -= 2
+        if c == ch("p") || c == ch("P") {
+            return Result.failure(error: Error("Unicode classes like \\p\{L} aren't supported at index {i} of \"{pattern}\""))
+        }
+        if isWord(c) {
+            return Result.failure(error: Error("unknown escape \\{character(c)} at index {i} of \"{pattern}\""))
+        }
+        i += 2
+        Result.ok(value: [c, c])
+    }
+
+    // The code point of \xHH, \x\{H…}, \uHHHH or \u\{H…}, with i just past
+    // the x or u.
+    fn hexEscape(_ isU: Bool) -> Result<Int> {
+        var digits = 2
+        if isU {
+            digits = 4
+        }
+        var braced = false
+        if i < p.count && p[i] == ch("\{") {
+            braced = true
+            i += 1
+            digits = 6
+        }
+        var value = 0
+        var count = 0
+        while i < p.count && count < digits && hexDigit(p[i]) >= 0 {
+            value = value * 16 + hexDigit(p[i])
+            i += 1
+            count += 1
+        }
+        if braced {
+            if i >= p.count || p[i] != ch("}") || count == 0 {
+                return Result.failure(error: Error("a \\x\{…} escape needs hex digits and a closing brace at index {i} of \"{pattern}\""))
+            }
+            i += 1
+        } else if count != digits {
+            return Result.failure(error: Error("the escape needs {digits} hex digits at index {i} of \"{pattern}\""))
+        }
+        if value > maxCodePoint {
+            return Result.failure(error: Error("\\x\{{value}} is beyond the last code point at index {i} of \"{pattern}\""))
+        }
+        Result.ok(value: value)
+    }
+
+    // A class: [abc], [^a-z], [\d.], [[:alpha:]].
+    fn parseClass() -> Result<Int> {
+        let open = i
+        i += 1
+        var negate = false
+        if i < p.count && p[i] == ch("^") {
+            negate = true
+            i += 1
+        }
+        var ranges: [Int] = []
+        var first = true
+        while i < p.count && (p[i] != ch("]") || first) {
+            first = false
+            if looking("[:") {
+                let close = findPosixEnd()
+                if close < 0 {
+                    // Not a POSIX class: the [ is just a character.
+                    ranges.append(p[i])
+                    ranges.append(p[i])
+                    i += 1
+                } else {
+                    var name = textOf(p, i + 2, close)
+                    var opposite = false
+                    if name.hasPrefix("^") {
+                        opposite = true
+                        name = name.substring(from: 1, to: name.count)
+                    }
+                    var set = posixRanges(name)
+                    if set.isEmpty {
+                        return problem("unknown class [:{name}:]")
+                    }
+                    if opposite {
+                        set = negated(set)
+                    }
+                    ranges.appendAll(set)
+                    i = close + 2
+                }
+            } else {
+                let lowSet = try classItem()
+                if lowSet.count == 2 && lowSet[0] == lowSet[1] && i + 1 < p.count && p[i] == ch("-") && p[i + 1] != ch("]") {
+                    i += 1
+                    let highSet = try classItem()
+                    if highSet.count != 2 || highSet[0] != highSet[1] {
+                        return problem("a range in a class must end in one character")
+                    }
+                    if highSet[0] < lowSet[0] {
+                        return problem("the range {character(lowSet[0])}-{character(highSet[0])} runs backwards")
+                    }
+                    ranges.append(lowSet[0])
+                    ranges.append(highSet[0])
+                } else {
+                    ranges.appendAll(lowSet)
+                }
+            }
+        }
+        if i >= p.count {
+            i = open
+            return problem("missing ] for this [")
+        }
+        i += 1
+        var set = normalized(ranges)
+        if caseless {
+            set = caseFolded(set)
+        }
+        if negate {
+            set = negated(set)
+        }
+        Result.ok(value: addClass(set))
+    }
+
+    // One character or escape in a class, as ranges.
+    fn classItem() -> Result<[Int]> {
+        if p[i] == ch("\\") {
+            if i + 1 >= p.count {
+                return Result.failure(error: Error("the pattern ends with a lone \\ at index {i} of \"{pattern}\""))
+            }
+            let c = p[i + 1]
+            if c == ch("b") || c == ch("B") || c == ch("A") || c == ch("z") {
+                return Result.failure(error: Error("\\{character(c)} can't go in a class at index {i} of \"{pattern}\""))
+            }
+            return escapedSet()
+        }
+        let c = p[i]
+        i += 1
+        Result.ok(value: [c, c])
+    }
+
+    // The index of the : in the :] that ends a POSIX class starting at i
+    // ([:), or -1 when there isn't one.
+    fn findPosixEnd() -> Int {
+        var k = i + 2
+        while k + 1 < p.count && p[k] != ch("]") {
+            if p[k] == ch(":") && p[k + 1] == ch("]") {
+                return k
+            }
+            k += 1
+        }
+        -1
+    }
+}
+
+// The value of a hex digit, or -1.
+fn hexDigit(_ c: Int) -> Int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    -1
+}
+
+// The text of the code points from `from` up to `to`.
+fn textOf(_ cps: [Int], _ from: Int, _ to: Int) -> String {
+    var bytes: [Int] = []
+    var k = from
+    while k < to {
+        let c = cps[k]
+        if c < 128 {
+            bytes.append(c)
+        } else if c < 2048 {
+            bytes.append(192 + c / 64)
+            bytes.append(128 + c % 64)
+        } else if c < 65536 {
+            bytes.append(224 + c / 4096)
+            bytes.append(128 + (c / 64) % 64)
+            bytes.append(128 + c % 64)
+        } else {
+            bytes.append(240 + c / 262144)
+            bytes.append(128 + (c / 4096) % 64)
+            bytes.append(128 + (c / 64) % 64)
+            bytes.append(128 + c % 64)
+        }
+        k += 1
+    }
+    Data(bytes: bytes).text ?? ""
+}

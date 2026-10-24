@@ -1,0 +1,198 @@
+// regex: compiling. The parsed tree becomes a program for the matching
+// machine (see machine.tsl): instructions that consume one character
+// (a literal, a class, any), and ones that don't (split into two paths,
+// jump, save a position, check an assertion, match). Repeats are written
+// out as copies and loops.
+//
+// Author: Alexius Academia
+// Date: 2026-10-24
+
+// Instruction kinds.
+let opChar = 0
+let opClass = 1
+let opAny = 2
+let opSplit = 3
+let opJump = 4
+let opSave = 5
+let opAssert = 6
+let opMatch = 7
+
+// The most instructions a program may have.
+let maxProgram = 200000
+
+// A program being written: an instruction is `ops[k]` with its arguments
+// `xs[k]` and `ys[k]`.
+struct Builder {
+    nodes: [Node]
+    ops: [Int] = []
+    xs: [Int] = []
+    ys: [Int] = []
+    tooBig: Bool = false
+
+    // Adds an instruction and gives its index.
+    fn emit(_ op: Int, _ x: Int, _ y: Int) -> Int {
+        ops.append(op)
+        xs.append(x)
+        ys.append(y)
+        if ops.count > maxProgram {
+            tooBig = true
+        }
+        ops.count - 1
+    }
+
+    // Writes the instructions for node n.
+    fn node(_ n: Int) {
+        if tooBig {
+            return
+        }
+        let nd = nodes[n]
+        let kind = nd.kind
+        if kind == nodeLiteral {
+            let ignored = emit(opChar, nd.value, 0)
+        } else if kind == nodeClass {
+            let ignored = emit(opClass, nd.value, 0)
+        } else if kind == nodeAny {
+            let ignored = emit(opAny, nd.value, 0)
+        } else if kind == nodeAssert {
+            let ignored = emit(opAssert, nd.value, 0)
+        } else if kind == nodeConcat {
+            for child in nd.children {
+                node(child)
+            }
+        } else if kind == nodeAlternate {
+            // split L1, L2; L1: first; jump end; L2: split … ; last
+            var jumps: [Int] = []
+            let last = nd.children.count - 1
+            for (k, child) in nd.children.enumerated() {
+                if k < last {
+                    let split = emit(opSplit, 0, 0)
+                    xs[split] = split + 1
+                    node(child)
+                    jumps.append(emit(opJump, 0, 0))
+                    ys[split] = ops.count
+                } else {
+                    node(child)
+                }
+            }
+            for j in jumps {
+                xs[j] = ops.count
+            }
+        } else if kind == nodeGroup {
+            let ignored = emit(opSave, 2 * nd.value, 0)
+            node(nd.children[0])
+            let ignored2 = emit(opSave, 2 * nd.value + 1, 0)
+        } else if kind == nodeRepeat {
+            repeat(nd)
+        }
+    }
+
+    // A split whose preferred path is `a` when greedy, `b` otherwise.
+    fn split(_ at: Int, _ a: Int, _ b: Int, _ greedy: Bool) {
+        if greedy {
+            xs[at] = a
+            ys[at] = b
+        } else {
+            xs[at] = b
+            ys[at] = a
+        }
+    }
+
+    // Whether node n can match without consuming anything.
+    fn nullable(_ n: Int) -> Bool {
+        let nd = nodes[n]
+        let kind = nd.kind
+        if kind == nodeEmpty || kind == nodeAssert {
+            return true
+        }
+        if kind == nodeConcat {
+            return nd.children.all(where: { c in nullable(c) })
+        }
+        if kind == nodeAlternate {
+            return nd.children.any(where: { c in nullable(c) })
+        }
+        if kind == nodeRepeat {
+            return nd.low == 0 || nullable(nd.children[0])
+        }
+        if kind == nodeGroup {
+            return nullable(nd.children[0])
+        }
+        false
+    }
+
+    // x+: L: x; split L, out.
+    fn plus(_ child: Int, _ greedy: Bool) {
+        let loop = ops.count
+        node(child)
+        let s = emit(opSplit, 0, 0)
+        split(s, loop, s + 1, greedy)
+    }
+
+    // x*: L: split L+1, out; x; jump L. When x can match empty, (x+)?
+    // instead, as RE2 does, so the groups inside get the same positions.
+    fn star(_ child: Int, _ greedy: Bool) {
+        if nullable(child) {
+            let s = emit(opSplit, 0, 0)
+            plus(child, greedy)
+            split(s, s + 1, ops.count, greedy)
+            return
+        }
+        let loop = emit(opSplit, 0, 0)
+        node(child)
+        let ignored = emit(opJump, loop, 0)
+        split(loop, loop + 1, ops.count, greedy)
+    }
+
+    // x{low,high}, as RE2 writes it out: x{0,} is x*, x{n,} is n − 1
+    // copies of x then x+, and x{n,m} is n copies then m − n nested
+    // optional ones.
+    fn repeat(_ nd: Node) {
+        let child = nd.children[0]
+        if nd.high < 0 {
+            if nd.low == 0 {
+                star(child, nd.greedy)
+                return
+            }
+            for _ in 0..nd.low - 1 {
+                if tooBig {
+                    return
+                }
+                node(child)
+            }
+            plus(child, nd.greedy)
+            return
+        }
+        for _ in 0..nd.low {
+            if tooBig {
+                return
+            }
+            node(child)
+        }
+        // split L1, end; L1: x; split L2, end; L2: x … end
+        var splits: [Int] = []
+        for _ in nd.low..nd.high {
+            if tooBig {
+                return
+            }
+            let s = emit(opSplit, 0, 0)
+            splits.append(s)
+            node(child)
+        }
+        for s in splits {
+            split(s, s + 1, ops.count, nd.greedy)
+        }
+    }
+}
+
+// The literal code point every match must start with, or -1 when there
+// isn't one: lets the machine skip ahead to where a match can start.
+fn firstLiteral(_ ops: [Int], _ xs: [Int]) -> Int {
+    // After the Save 0 that starts every program.
+    var k = 1
+    while k < ops.count && ops[k] == opSave {
+        k += 1
+    }
+    if k < ops.count && ops[k] == opChar {
+        return xs[k]
+    }
+    -1
+}

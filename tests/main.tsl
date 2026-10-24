@@ -1,0 +1,249 @@
+// regex's tests. First, thousands of cases checked against Go's regexp
+// package (RE2: the same syntax and matching rules), saved in cases.json by
+// tools/oracle/main.go: for each pattern and text, whether the pattern is
+// accepted, every match with its groups' positions, a replacement, a split,
+// and whether it matches the whole text. Then the API, its error messages,
+// Unicode positions and the promise of linear time, by hand.
+// `tessel run tests` prints the failures and a count, and exits with 1 if
+// any check failed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-24
+
+import ".."
+
+// One case from cases.json.
+struct Case {
+    pattern: String
+    text: String
+    ok: Bool
+    matches: [[Int]]
+    replaced: String
+    split: [String]
+    whole: Bool
+}
+
+// Checks that `got` is true: 1 if it isn't.
+fn holds(_ name: String, _ got: Bool) -> Int {
+    if got {
+        print("ok    {name}")
+        return 0
+    }
+    print("FAIL  {name}")
+    1
+}
+
+// Checks that `got` is `expected`.
+fn same(_ name: String, _ got: String, _ expected: String) -> Int {
+    if got == expected {
+        print("ok    {name}: {got}")
+        return 0
+    }
+    print("FAIL  {name}: \"{got}\", expected \"{expected}\"")
+    1
+}
+
+// Checks that compiling `pattern` fails with a message containing `part`.
+fn refuses(_ name: String, _ pattern: String, _ part: String) -> Int {
+    if let e = regex.compile(pattern).error() {
+        if e.message.contains(part) {
+            print("ok    {name}: {e.message}")
+            return 0
+        }
+        print("FAIL  {name}: \"{e.message}\" doesn't mention \"{part}\"")
+        return 1
+    }
+    print("FAIL  {name}: the pattern was accepted")
+    1
+}
+
+// The text with line breaks and tabs shown, for failure messages.
+fn shown(_ s: String) -> String {
+    s.replace("\n", with: "\\n").replace("\t", with: "\\t")
+}
+
+// The cases from Go: how many failed.
+fn oracle() -> Result<Int> {
+    var path = "tests/cases.json"
+    if !fileExists(path) {
+        path = "cases.json"
+    }
+    let cases: [Case] = try decodeJson(try readText(path))
+    var failed = 0
+    var shownFailures = 0
+    for c in cases {
+        var problem = ""
+        match regex.compile(c.pattern) {
+            .failure(e) -> {
+                if c.ok {
+                    problem = "refused, but Go accepts it: {e.message}"
+                }
+            }
+            .ok(r) -> {
+                if !c.ok {
+                    problem = "accepted, but Go refuses it"
+                } else {
+                    let found = r.findAll(c.text)
+                    var positions: [[Int]] = []
+                    for m in found {
+                        positions.append(m.positions)
+                    }
+                    if positions != c.matches {
+                        problem = "matches {positions}, Go {c.matches}"
+                    } else {
+                        let replaced = r.replaceAll(c.text, with: "<$\{1}|$0|$$>")
+                        if replaced != c.replaced {
+                            problem = "replaced \"{shown(replaced)}\", Go \"{shown(c.replaced)}\""
+                        } else if r.split(c.text) != c.split {
+                            problem = "split {r.split(c.text)}, Go {c.split}"
+                        } else if r.matchesWhole(c.text) != c.whole {
+                            problem = "matchesWhole {r.matchesWhole(c.text)}, Go {c.whole}"
+                        }
+                    }
+                }
+            }
+        }
+        if problem != "" {
+            failed += 1
+            if shownFailures < 60 {
+                print("FAIL  /{shown(c.pattern)}/ on \"{shown(c.text)}\": {problem}")
+                shownFailures += 1
+            }
+        }
+    }
+    print("{cases.count - failed} of {cases.count} cases agree with Go")
+    Result.ok(value: failed)
+}
+
+// The API, by hand.
+fn api() -> Result<Int> {
+    var failed = 0
+    let date = try regex.compile("(?P<y>\\d\{4})-(\\d\{2})-(?<d>\\d\{2})")
+    failed += holds("groupCount", date.groupCount == 3)
+    failed += holds("groupNames", date.groupNames == ["", "y", "", "d"])
+    failed += holds("groupIndex", date.groupIndex("d") == 3 && date.groupIndex("nope") == nil)
+    if let m = date.find("Due 2026-10-31, paid 2026-11-02.") {
+        failed += holds("find: where", m.start == 4 && m.end == 14)
+        failed += same("find: text", m.text, "2026-10-31")
+        failed += same("group(1)", m.group(1) ?? "-", "2026")
+        failed += same("named", m.named("d") ?? "-", "31")
+        failed += holds("groupStart and groupEnd", m.groupStart(2) == 9 && m.groupEnd(2) == 11)
+        failed += holds("no group 4", m.group(4) == nil && m.named("x") == nil)
+        failed += holds("Match.groupCount", m.groupCount == 3)
+    } else {
+        failed += holds("find", false)
+    }
+    if let m = date.find("Due 2026-10-31, paid 2026-11-02.", from: 5) {
+        failed += same("find from", m.text, "2026-11-02")
+    } else {
+        failed += holds("find from", false)
+    }
+    failed += holds("find from past the end", date.find("2026-10-31", from: 11) == nil)
+    let optional = regex.must("(a)|(b)")
+    if let m = optional.find("b") {
+        failed += holds("a group that took no part is nil", m.group(1) == nil && m.group(2) == "b" && m.groupStart(1) == nil)
+    }
+    failed += holds("count", regex.must("o").count("foo boo") == 4)
+    failed += holds("matches", regex.must("\\d").matches("room 4") && !regex.must("\\d").matches("room"))
+    failed += same("replace: the first only", regex.must("o").replace("foo", with: "0"), "f0o")
+    failed += same("replace: no match", regex.must("z").replace("foo", with: "0"), "foo")
+    failed += same("replaceAll with names", regex.must("(?P<k>\\w+)=(?P<v>\\w+)").replaceAll("a=1, b=2", with: "$\{v}=$<k>"), "1=a, 2=b")
+    failed += same("replaceAll: $$ and a lone $", regex.must("x").replaceAll("x", with: "$$ $"), "$ $")
+    failed += same("replaceAll: unknown group is empty", regex.must("x").replaceAll("x", with: "[$7][$\{nope}]"), "[][]")
+    failed += same("replaceEach", regex.must("\\b[a-z]").replaceEach("hello big world") { m in m.text.uppercase() }, "Hello Big World")
+    failed += holds("split", regex.must("\\s*,\\s*").split("a , b,c ,d") == ["a", "b", "c", "d"])
+    failed += holds("split with a limit", regex.must(",").split("a,b,c,d", limit: 2) == ["a", "b,c,d"])
+    failed += holds("split with limit 1", regex.must(",").split("a,b", limit: 1) == ["a,b"])
+    failed += same("escape", regex.escape("1+1=2? (a|b) [x] \{y} ^$ \\ ."), "1\\+1=2\\? \\(a\\|b\\) \\[x\\] \\\{y\\} \\^\\$ \\\\ \\.")
+    let tricky = "a.b*c (d)"
+    failed += holds("escape matches the text exactly", regex.must(regex.escape(tricky)).matchesWhole(tricky))
+    failed += holds("\\u escapes", regex.must("\\u00e9\\u\{1F600}").matches("é😀"))
+    failed += holds("\\x escapes", regex.must("\\x41\\x\{42}").matches("AB"))
+    Result.ok(value: failed)
+}
+
+// Error messages, by hand.
+fn errors() -> Int {
+    var failed = 0
+    failed += refuses("missing )", "(\\d+", "missing ) for this ( at index 0")
+    failed += refuses("unmatched )", "a)", "unmatched ) at index 1")
+    failed += refuses("missing ]", "x[ab", "missing ] for this [ at index 1")
+    failed += refuses("nothing to repeat", "*a", "nothing to repeat")
+    failed += refuses("a repeat of a repeat", "a**", "a repeat right after another")
+    failed += refuses("backwards counts", "a\{3,2}", "counts down")
+    failed += refuses("too many", "a\{1001}", "1000 at most")
+    failed += refuses("backreferences", "(a)\\1", "backreferences")
+    failed += refuses("lookahead", "a(?=b)", "lookarounds")
+    failed += refuses("lookbehind", "(?<=a)b", "lookarounds")
+    failed += refuses("Unicode classes", "\\pL", "Unicode classes")
+    failed += refuses("unknown escape", "\\q", "unknown escape \\q")
+    failed += refuses("backwards range", "[z-a]", "runs backwards")
+    failed += refuses("unknown POSIX class", "[[:foo:]]", "unknown class [:foo:]")
+    failed += refuses("unknown flag", "(?z)a", "unknown flag")
+    failed += refuses("bad group name", "(?P<a-b>x)", "a group's name")
+    failed += refuses("two groups of a name", "(?P<n>a)(?P<n>b)", "two groups are named \"n\"")
+    failed += refuses("lone backslash", "ab\\", "lone \\")
+    failed += refuses("too big", "((a\{1000})\{1000})\{1000}", "too big")
+    failed
+}
+
+// Unicode and positions, by hand.
+fn unicode() -> Int {
+    var failed = 0
+    let text = "naïve café 😀 Ωmega"
+    for m in regex.must("\\S+").findAll(text) {
+        failed += holds("positions work with substring: {m.text}", text.substring(from: m.start, to: m.end) == m.text)
+    }
+    failed += holds("an emoji is one character", regex.must("^.$").matches("😀"))
+    failed += holds("(?i) for Latin-1", regex.must("(?i)CAFÉ").matches("café"))
+    failed += holds("(?i) for Greek", regex.must("(?i)ωmega").matches("ΩMEGA"))
+    failed += holds("(?i) for Cyrillic", regex.must("(?i)мир").matches("МИР"))
+    failed += holds("(?i) for Latin Extended-A", regex.must("(?i)łódź").matches("ŁÓDŹ"))
+    failed += holds("\\w is ASCII", !regex.must("^\\w+$").matches("café"))
+    failed
+}
+
+// Linear time: patterns that make backtracking engines take exponential
+// time finish at once.
+fn speed() -> Int {
+    var failed = 0
+    var a = ""
+    for _ in 0..20000 {
+        a += "a"
+    }
+    for pattern in ["(a+)+$", "(a|aa)*$", "(a*)*b", "(a|a)*c", "(.*a)\{20}"] {
+        let r = regex.must(pattern)
+        let started = now()
+        let found = r.matches(a + "!")
+        let took = now() - started
+        failed += holds("{pattern} on 20 000 a's ({found}): {took.formatted(decimals: 3)} s", took < 5.0)
+    }
+    // Twice the text takes about twice the time, not four times.
+    let r = regex.must("(\\w+\\s?)*$")
+    var short = ""
+    for _ in 0..2000 {
+        short += "word "
+    }
+    let long = short + short
+    let t0 = now()
+    let ignored1 = r.matches(short + "!")
+    let t1 = now()
+    let ignored2 = r.matches(long + "!")
+    let t2 = now()
+    let ratio = (t2 - t1) / max(t1 - t0, 1e-6)
+    failed += holds("twice the text, about twice the time ({ratio.formatted(decimals: 2)}×)", ratio < 3.5)
+    failed
+}
+
+fn main() {
+    var failed = try oracle()
+    failed += try api()
+    failed += errors()
+    failed += unicode()
+    failed += speed()
+    if failed > 0 {
+        print("\n{failed} failed")
+        exit(1)
+    }
+    print("\nall passed")
+}
